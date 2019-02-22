@@ -17,6 +17,7 @@
 package badger
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"math/rand"
@@ -326,8 +327,10 @@ func (lc *levelsController) compactBuildTables(level int, cd compactDef, limiter
 	minReadTs := lc.kv.orc.readMark.MinReadTs()
 
 	var filter CompactionFilter
+	var guards [][]byte
 	if lc.kv.opt.CompactionFilterFactory != nil {
 		filter = lc.kv.opt.CompactionFilterFactory()
+		guards = filter.Guards()
 	}
 
 	var lastKey, skipKey []byte
@@ -353,6 +356,7 @@ func (lc *levelsController) compactBuildTables(level int, cd compactDef, limiter
 		}
 
 		var numKeys uint64
+		var currGuard []byte
 		for ; it.Valid() && (end == nil || y.CompareKeys(it.Key(), end) < 0); it.Next() {
 			// See if we need to skip this key.
 			if len(skipKey) > 0 {
@@ -364,7 +368,22 @@ func (lc *levelsController) compactBuildTables(level int, cd compactDef, limiter
 				}
 			}
 
+			if len(currGuard) == 0 {
+				idx := sort.Search(len(guards), func(i int) bool {
+					return bytes.Compare(it.Key(), guards[i]) < 0
+				})
+				if idx < len(guards) && idx >= 0 {
+					currGuard = guards[idx]
+					log.Errorf("current guard %s", string(currGuard))
+				}
+			}
+
 			if !y.SameKey(it.Key(), lastKey) {
+				if len(currGuard) > 0 && bytes.Compare(it.Key(), currGuard) > 0 {
+					// reset currGuard
+					currGuard = nil
+					break
+				}
 				if builder.ReachedCapacity(lc.kv.opt.MaxTableSize) {
 					// Only break if we are on a different key, and have reached capacity. We want
 					// to ensure that all versions of the key are stored in the same sstable, and

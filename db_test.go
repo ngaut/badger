@@ -1171,6 +1171,10 @@ func (f *testFilter) Filter(key, val, userMeta []byte) Decision {
 	return DecisionKeep
 }
 
+func (f *testFilter) Guards() [][]byte {
+	return nil
+}
+
 func TestCompactionFilter(t *testing.T) {
 	dir, err := ioutil.TempDir("", "badger")
 	require.NoError(t, err)
