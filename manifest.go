@@ -397,6 +397,12 @@ func delFromManifest(manifest *Manifest, mc *protos.ManifestChange) {
 	if !ok {
 		log.Fatalf("MANIFEST removes non-existing table %d", mc.Id)
 	}
+
+	_, ok = manifest.Levels[tm.Level].Tables[mc.Id]
+	if !ok {
+		log.Fatalf("MANIFEST removes non-existing table %d", mc.Id)
+	}
+
 	delete(manifest.Levels[tm.Level].Tables, mc.Id)
 	delete(manifest.Tables, mc.Id)
 }
@@ -412,7 +418,6 @@ func applyManifestChange(manifest *Manifest, mc *protos.ManifestChange) error {
 	case protos.ManifestChange_MOVE_DOWN:
 		delFromManifest(manifest, mc)
 		addNewToManifest(manifest, mc)
-
 	default:
 		return fmt.Errorf("MANIFEST file has invalid manifestChange op")
 	}
