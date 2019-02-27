@@ -29,6 +29,7 @@ import (
 
 	"github.com/coocood/badger/protos"
 	"github.com/coocood/badger/y"
+	"github.com/ngaut/log"
 	"github.com/pkg/errors"
 )
 
@@ -378,28 +379,40 @@ func ReplayManifestFile(fp *os.File) (ret Manifest, truncOffset int64, err error
 	return build, offset, err
 }
 
-func applyManifestChange(build *Manifest, tc *protos.ManifestChange) error {
-	switch tc.Op {
+func addNewToManifest(manifest *Manifest, mc *protos.ManifestChange) {
+	if _, ok := manifest.Tables[mc.Id]; ok {
+		log.Fatalf("MANIFEST invalid, table %d exists", mc.Id)
+	}
+	manifest.Tables[mc.Id] = tableManifest{
+		Level: uint8(mc.Level),
+	}
+	for len(manifest.Levels) <= int(mc.Level) {
+		manifest.Levels = append(manifest.Levels, levelManifest{make(map[uint64]struct{})})
+	}
+	manifest.Levels[mc.Level].Tables[mc.Id] = struct{}{}
+}
+
+func delFromManifest(manifest *Manifest, mc *protos.ManifestChange) {
+	tm, ok := manifest.Tables[mc.Id]
+	if !ok {
+		log.Fatalf("MANIFEST removes non-existing table %d", mc.Id)
+	}
+	delete(manifest.Levels[tm.Level].Tables, mc.Id)
+	delete(manifest.Tables, mc.Id)
+}
+
+func applyManifestChange(manifest *Manifest, mc *protos.ManifestChange) error {
+	switch mc.Op {
 	case protos.ManifestChange_CREATE:
-		if _, ok := build.Tables[tc.Id]; ok {
-			return fmt.Errorf("MANIFEST invalid, table %d exists", tc.Id)
-		}
-		build.Tables[tc.Id] = tableManifest{
-			Level: uint8(tc.Level),
-		}
-		for len(build.Levels) <= int(tc.Level) {
-			build.Levels = append(build.Levels, levelManifest{make(map[uint64]struct{})})
-		}
-		build.Levels[tc.Level].Tables[tc.Id] = struct{}{}
-		build.Creations++
+		addNewToManifest(manifest, mc)
+		manifest.Creations++
 	case protos.ManifestChange_DELETE:
-		tm, ok := build.Tables[tc.Id]
-		if !ok {
-			return fmt.Errorf("MANIFEST removes non-existing table %d", tc.Id)
-		}
-		delete(build.Levels[tm.Level].Tables, tc.Id)
-		delete(build.Tables, tc.Id)
-		build.Deletions++
+		delFromManifest(manifest, mc)
+		manifest.Deletions++
+	case protos.ManifestChange_MOVE_DOWN:
+		delFromManifest(manifest, mc)
+		addNewToManifest(manifest, mc)
+
 	default:
 		return fmt.Errorf("MANIFEST file has invalid manifestChange op")
 	}
@@ -422,6 +435,14 @@ func makeTableCreateChange(id uint64, level int) *protos.ManifestChange {
 		Id:    id,
 		Op:    protos.ManifestChange_CREATE,
 		Level: uint32(level),
+	}
+}
+
+func makeTableMoveDownChange(id uint64, moveToLevel int) *protos.ManifestChange {
+	return &protos.ManifestChange{
+		Id:    id,
+		Op:    protos.ManifestChange_MOVE_DOWN,
+		Level: uint32(moveToLevel),
 	}
 }
 

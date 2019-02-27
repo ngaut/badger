@@ -23,7 +23,6 @@ import (
 	"math/rand"
 	"os"
 	"sort"
-	"sync"
 	"time"
 
 	"github.com/coocood/badger/options"
@@ -324,7 +323,7 @@ func shouldFinishFile(key, guard []byte, builder *table.Builder, maxSize int64) 
 }
 
 // compactBuildTables merge topTables and botTables to form a list of new tables.
-func (lc *levelsController) compactBuildTables(level int, cd compactDef, limiter *rate.Limiter, start, end []byte) ([]*table.Table, error) {
+func (lc *levelsController) compactBuildTables(level int, cd compactDef, limiter *rate.Limiter, start, end []byte) ([]*table.Table, bool, error) {
 	topTables := cd.top
 	botTables := cd.bot
 
@@ -332,19 +331,17 @@ func (lc *levelsController) compactBuildTables(level int, cd compactDef, limiter
 	log.Infof("Level %d overlaps with lower levels: %v, start: %s, end: %s, topTables:%s, botTables:%s",
 		level, hasOverlap, start, end, topTables, botTables)
 
-	/*
-		if level > 0 && !hasOverlap {
-			for _, t := range topTables {
-				t.IncrRef()
-			}
-
-			newTables := append([]*table.Table{}, topTables...)
-			sort.Slice(newTables, func(i, j int) bool {
-				return y.CompareKeys(newTables[i].Biggest(), newTables[j].Biggest()) < 0
-			})
-			return newTables, nil
+	if level > 0 && !hasOverlap {
+		for _, t := range topTables {
+			t.IncrRef()
 		}
-	*/
+
+		newTables := append([]*table.Table{}, topTables...)
+		sort.Slice(newTables, func(i, j int) bool {
+			return y.CompareKeys(newTables[i].Biggest(), newTables[j].Biggest()) < 0
+		})
+		return newTables, true, nil
+	}
 
 	// Try to collect stats so that we can inform value log about GC. That would help us find which
 	// value log file should be GCed.
@@ -486,20 +483,27 @@ func (lc *levelsController) compactBuildTables(level int, cd compactDef, limiter
 	})
 	lc.kv.vlog.updateGCStats(discardStats.discardSpaces)
 	log.Infof("Discard stats: %v", discardStats)
-	return newTables, nil
+	return newTables, false, nil
 }
 
-func buildChangeSet(cd *compactDef, newTables []*table.Table) protos.ManifestChangeSet {
+func buildChangeSet(cd *compactDef, newTables []*table.Table, moveDown bool) protos.ManifestChangeSet {
 	changes := []*protos.ManifestChange{}
-	for _, table := range newTables {
-		changes = append(changes, makeTableCreateChange(table.ID(), cd.nextLevel.level))
+	if moveDown {
+		for _, table := range newTables {
+			changes = append(changes, makeTableMoveDownChange(table.ID(), cd.nextLevel.level))
+		}
+	} else {
+		for _, table := range newTables {
+			changes = append(changes, makeTableCreateChange(table.ID(), cd.nextLevel.level))
+		}
+		for _, table := range cd.top {
+			changes = append(changes, makeTableDeleteChange(table.ID()))
+		}
+		for _, table := range cd.bot {
+			changes = append(changes, makeTableDeleteChange(table.ID()))
+		}
 	}
-	for _, table := range cd.top {
-		changes = append(changes, makeTableDeleteChange(table.ID()))
-	}
-	for _, table := range cd.bot {
-		changes = append(changes, makeTableDeleteChange(table.ID()))
-	}
+
 	return protos.ManifestChangeSet{Changes: changes}
 }
 
@@ -674,10 +678,12 @@ func (lc *levelsController) determineSubCompactPlan(bounds []rangeWithSize) (int
 	return n, size / n
 }
 
-func (lc *levelsController) runSubCompacts(l int, cd compactDef, limiter *rate.Limiter) ([]*table.Table, error) {
+/*
+func (lc *levelsController) runSubCompacts(l int, cd compactDef, limiter *rate.Limiter) ([]*table.Table, bool, error) {
 	type jobResult struct {
-		tbls []*table.Table
-		err  error
+		tbls     []*table.Table
+		moveDown bool
+		err      error
 	}
 
 	inputBounds := cd.getInputBounds()
@@ -697,8 +703,9 @@ func (lc *levelsController) runSubCompacts(l int, cd compactDef, limiter *rate.L
 
 			wg.Add(1)
 			go func(job int) {
-				newTables, err := lc.compactBuildTables(l, cd, limiter, start, end)
+				newTables, moveDown, err := lc.compactBuildTables(l, cd, limiter, start, end)
 				results[job].tbls = newTables
+				results[job].moveDown = moveDown
 				results[job].err = err
 				wg.Done()
 			}(jobNo)
@@ -715,7 +722,7 @@ func (lc *levelsController) runSubCompacts(l int, cd compactDef, limiter *rate.L
 	var numTables int
 	for _, result := range results {
 		if result.err != nil {
-			return nil, result.err
+			return nil, result.moveDown, result.err
 		}
 		numTables += len(result.tbls)
 	}
@@ -725,8 +732,9 @@ func (lc *levelsController) runSubCompacts(l int, cd compactDef, limiter *rate.L
 		newTables = append(newTables, result.tbls...)
 	}
 
-	return newTables, nil
+	return nil, newTables, nil
 }
+*/
 
 func (lc *levelsController) shouldStartSubCompaction(cd compactDef) bool {
 	if lc.kv.opt.MaxSubCompaction <= 1 || len(cd.bot) == 0 {
@@ -748,16 +756,11 @@ func (lc *levelsController) runCompactDef(l int, cd compactDef, limiter *rate.Li
 	thisLevel := cd.thisLevel
 	nextLevel := cd.nextLevel
 
-	// Table should never be moved directly between levels, always be rewritten to allow discarding
-	// invalid versions.
-
-	var newTables []*table.Table
-	var err error
-	if lc.shouldStartSubCompaction(cd) {
-		newTables, err = lc.runSubCompacts(l, cd, limiter)
-	} else {
-		newTables, err = lc.compactBuildTables(l, cd, limiter, nil, nil)
-	}
+	//	if lc.shouldStartSubCompaction(cd) {
+	//		newTables, err = lc.runSubCompacts(l, cd, limiter)
+	//	} else {
+	newTables, moveDown, err := lc.compactBuildTables(l, cd, limiter, nil, nil)
+	//	}
 	if err != nil {
 		return err
 	}
@@ -767,7 +770,7 @@ func (lc *levelsController) runCompactDef(l int, cd compactDef, limiter *rate.Li
 			err = decErr
 		}
 	}()
-	changeSet := buildChangeSet(&cd, newTables)
+	changeSet := buildChangeSet(&cd, newTables, moveDown)
 
 	// We write to the manifest _before_ we delete files (and after we created files)
 	if err := lc.kv.manifest.addChanges(changeSet.Changes); err != nil {
