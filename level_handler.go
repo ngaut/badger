@@ -125,6 +125,10 @@ func assertTablesOrder(tables []*table.Table) {
 		y.AssertTruef(y.CompareKeys(tables[i].Biggest(), tables[i+1].Biggest()) < 0,
 			"y.CompareKeys(tables[i].Biggest() %v, tables[i+1].Biggest() %v",
 			tables[i].Biggest(), tables[i+1].Biggest())
+
+		y.AssertTruef(y.CompareKeys(tables[i].Biggest(), tables[i+1].Smallest()) < 0,
+			"y.CompareKeys(tables[i].Biggest() %v, tables[i+1].Smallest() %v",
+			tables[i].Biggest(), tables[i+1].Biggest())
 	}
 }
 

@@ -260,16 +260,8 @@ func (lc *levelsController) pickCompactLevels() (prios []compactionPriority) {
 
 func (lc *levelsController) hasOverlapTable(cd compactDef) bool {
 	kr := getKeyRange(cd.top)
-	for i := cd.nextLevel.level + 1; i < len(lc.levels); i++ {
-		lh := lc.levels[i]
-		lh.RLock()
-		left, right := lh.overlappingTables(levelHandlerRLocked{}, kr)
-		lh.RUnlock()
-		if right-left > 0 {
-			return true
-		}
-	}
-	return false
+	left, right := getTablesInRange(cd.bot, kr.left, kr.right)
+	return right-left > 0
 }
 
 type DiscardStats struct {
@@ -322,6 +314,22 @@ func shouldFinishFile(key, guard []byte, builder *table.Builder, maxSize int64) 
 	return false
 }
 
+func checkInvariants(cd compactDef, level int, overlap bool) {
+	if level > 0 {
+		assertTablesOrder(cd.top)
+		assertTablesOrder(cd.bot)
+		if len(cd.top) != 1 {
+			log.Fatalf("should never happend, top: %+v, bot: %+v", cd.top, cd.bot)
+		}
+	}
+
+	if !overlap {
+		if len(cd.bot) != 0 {
+			log.Fatalf("should never happend, top: %+v, bot: %+v", cd.top, cd.bot)
+		}
+	}
+}
+
 // compactBuildTables merge topTables and botTables to form a list of new tables.
 func (lc *levelsController) compactBuildTables(level int, cd compactDef, limiter *rate.Limiter, start, end []byte) ([]*table.Table, bool, error) {
 	topTables := cd.top
@@ -331,15 +339,13 @@ func (lc *levelsController) compactBuildTables(level int, cd compactDef, limiter
 	log.Infof("Level %d overlaps with lower levels: %v, start: %s, end: %s, topTables:%s, botTables:%s",
 		level, hasOverlap, start, end, topTables, botTables)
 
-	if level > 0 && !hasOverlap {
-		for _, t := range topTables {
-			t.IncrRef()
-		}
+	checkInvariants(cd, level, hasOverlap)
 
-		newTables := append([]*table.Table{}, topTables...)
-		sort.Slice(newTables, func(i, j int) bool {
-			return y.CompareKeys(newTables[i].Biggest(), newTables[j].Biggest()) < 0
-		})
+	// skip level 0, since it may has many table overlap with each other
+	if level > 0 && !hasOverlap {
+		newTables := []*table.Table{topTables[0]}
+		newTables[0].IncrRef()
+
 		return newTables, true, nil
 	}
 
@@ -352,7 +358,6 @@ func (lc *levelsController) compactBuildTables(level int, cd compactDef, limiter
 	if level == 0 {
 		iters = appendIteratorsReversed(iters, topTables, false)
 	} else {
-		y.Assert(len(topTables) == 1)
 		iters = []y.Iterator{topTables[0].NewIterator(false)}
 	}
 
@@ -483,6 +488,7 @@ func (lc *levelsController) compactBuildTables(level int, cd compactDef, limiter
 	})
 	lc.kv.vlog.updateGCStats(discardStats.discardSpaces)
 	log.Infof("Discard stats: %v", discardStats)
+	assertTablesOrder(newTables)
 	return newTables, false, nil
 }
 
